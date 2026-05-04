@@ -5,9 +5,13 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use if_addrs::{IfAddr, get_if_addrs};
 use serde::{Deserialize, Serialize};
-use tapo::{ApiClient, DiscoveryResult, StreamExt};
+use tapo::{
+    ApiClient, DiscoveryResult, StreamExt,
+    requests::{EnergyDataInterval, PowerDataInterval},
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -84,6 +88,60 @@ pub struct EnergySnapshot {
     pub month_energy_wh: u64,
     pub today_runtime_minutes: u64,
     pub month_runtime_minutes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnergyHistoryInterval {
+    Hourly {
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+    },
+    Daily {
+        start_date: NaiveDate,
+    },
+    Monthly {
+        start_date: NaiveDate,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerHistoryInterval {
+    Every5Minutes {
+        start_date_time: DateTime<Utc>,
+        end_date_time: DateTime<Utc>,
+    },
+    Hourly {
+        start_date_time: DateTime<Utc>,
+        end_date_time: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EnergyHistory {
+    pub local_time: NaiveDateTime,
+    pub start_date_time: DateTime<Utc>,
+    pub interval_length_minutes: u64,
+    pub entries: Vec<EnergyHistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EnergyHistoryEntry {
+    pub start_date_time: DateTime<Utc>,
+    pub energy_wh: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PowerHistory {
+    pub start_date_time: DateTime<Utc>,
+    pub end_date_time: DateTime<Utc>,
+    pub interval_length_minutes: u64,
+    pub entries: Vec<PowerHistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PowerHistoryEntry {
+    pub start_date_time: DateTime<Utc>,
+    pub power_w: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,9 +375,107 @@ impl TapoController {
         self.read_device(device).await
     }
 
+    pub async fn read_energy_history(
+        &self,
+        device: &DeviceConfig,
+        interval: EnergyHistoryInterval,
+    ) -> Result<EnergyHistory> {
+        let handler = self.energy_monitoring_handler(device).await?;
+        let result = handler.get_energy_data(interval.into()).await?;
+
+        Ok(EnergyHistory {
+            local_time: result.local_time,
+            start_date_time: result.start_date_time,
+            interval_length_minutes: result.interval_length,
+            entries: result
+                .entries
+                .into_iter()
+                .map(|entry| EnergyHistoryEntry {
+                    start_date_time: entry.start_date_time,
+                    energy_wh: entry.energy,
+                })
+                .collect(),
+        })
+    }
+
+    pub async fn read_power_history(
+        &self,
+        device: &DeviceConfig,
+        interval: PowerHistoryInterval,
+    ) -> Result<PowerHistory> {
+        let handler = self.energy_monitoring_handler(device).await?;
+        let result = handler.get_power_data(interval.into()).await?;
+
+        Ok(PowerHistory {
+            start_date_time: result.start_date_time,
+            end_date_time: result.end_date_time,
+            interval_length_minutes: result.interval_length,
+            entries: result
+                .entries
+                .into_iter()
+                .map(|entry| PowerHistoryEntry {
+                    start_date_time: entry.start_date_time,
+                    power_w: entry.power,
+                })
+                .collect(),
+        })
+    }
+
+    async fn energy_monitoring_handler(
+        &self,
+        device: &DeviceConfig,
+    ) -> Result<tapo::PlugEnergyMonitoringHandler> {
+        match device.model {
+            DeviceModel::P110 => Ok(self.client().p110(device.ip.to_string()).await?),
+            DeviceModel::P115 => Ok(self.client().p115(device.ip.to_string()).await?),
+            DeviceModel::P100 | DeviceModel::P105 => Err(anyhow!(
+                "{} at {} does not support energy monitoring",
+                device.model,
+                device.ip,
+            )),
+        }
+    }
+
     fn client(&self) -> ApiClient {
         ApiClient::new(&self.credentials.username, &self.credentials.password)
             .with_timeout(Duration::from_secs(self.timeout_seconds))
+    }
+}
+
+impl From<EnergyHistoryInterval> for EnergyDataInterval {
+    fn from(interval: EnergyHistoryInterval) -> Self {
+        match interval {
+            EnergyHistoryInterval::Hourly {
+                start_date,
+                end_date,
+            } => Self::Hourly {
+                start_date,
+                end_date,
+            },
+            EnergyHistoryInterval::Daily { start_date } => Self::Daily { start_date },
+            EnergyHistoryInterval::Monthly { start_date } => Self::Monthly { start_date },
+        }
+    }
+}
+
+impl From<PowerHistoryInterval> for PowerDataInterval {
+    fn from(interval: PowerHistoryInterval) -> Self {
+        match interval {
+            PowerHistoryInterval::Every5Minutes {
+                start_date_time,
+                end_date_time,
+            } => Self::Every5Minutes {
+                start_date_time,
+                end_date_time,
+            },
+            PowerHistoryInterval::Hourly {
+                start_date_time,
+                end_date_time,
+            } => Self::Hourly {
+                start_date_time,
+                end_date_time,
+            },
+        }
     }
 }
 
@@ -703,6 +859,7 @@ pub fn validate_device_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn plug(ip: &str) -> DeviceConfig {
         DeviceConfig {
@@ -744,6 +901,52 @@ mod tests {
         assert_eq!(supported_device_model("P110M"), Some(DeviceModel::P110));
         assert_eq!(supported_device_model("P115"), Some(DeviceModel::P115));
         assert_eq!(supported_device_model("L530"), None);
+    }
+
+    #[test]
+    fn maps_energy_history_intervals_to_tapo_requests() {
+        let start_date = NaiveDate::from_ymd_opt(2026, 4, 25).unwrap();
+        let end_date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+        let interval: EnergyDataInterval = EnergyHistoryInterval::Hourly {
+            start_date,
+            end_date,
+        }
+        .into();
+
+        match interval {
+            EnergyDataInterval::Hourly {
+                start_date: actual_start,
+                end_date: actual_end,
+            } => {
+                assert_eq!(actual_start, start_date);
+                assert_eq!(actual_end, end_date);
+            }
+            EnergyDataInterval::Daily { .. } | EnergyDataInterval::Monthly { .. } => {
+                panic!("expected hourly energy interval")
+            }
+        }
+    }
+
+    #[test]
+    fn maps_power_history_intervals_to_tapo_requests() {
+        let start_date_time = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+        let end_date_time = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        let interval: PowerDataInterval = PowerHistoryInterval::Every5Minutes {
+            start_date_time,
+            end_date_time,
+        }
+        .into();
+
+        match interval {
+            PowerDataInterval::Every5Minutes {
+                start_date_time: actual_start,
+                end_date_time: actual_end,
+            } => {
+                assert_eq!(actual_start, start_date_time);
+                assert_eq!(actual_end, end_date_time);
+            }
+            PowerDataInterval::Hourly { .. } => panic!("expected every 5 minutes power interval"),
+        }
     }
 
     #[test]
