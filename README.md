@@ -157,6 +157,10 @@ controller.set_power(&device, !snapshot.device_on).await?;
 
 Energy data comes from the `tapo` crate's local energy-monitoring handler for P110/P110M/P115 devices. The library currently exposes current power, today's energy/runtime, and current-month energy/runtime where the device reports those values.
 
+## Related Projects
+
+- [Fusebox](https://github.com/kierandrewett/fusebox): local browser control board for Tapo plugs, built on `tapoctl` discovery and control primitives.
+
 ## Development
 
 ```bash
@@ -164,3 +168,7 @@ cargo fmt
 cargo test
 cargo run -- --help
 ```
+
+## Licence
+
+Licensed under the Mozilla Public License Version 2.0. See [LICENSE](LICENSE).
