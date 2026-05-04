@@ -1,0 +1,7 @@
+[    9985ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://127.0.0.1:8787/api/scan:0
+[   69014ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8787/api/devices:0
+[   69014ms] TypeError: Failed to fetch
+    at loadDevices (http://127.0.0.1:8787/:375:36)
+[   72013ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8787/api/devices:0
+[   72014ms] TypeError: Failed to fetch
+    at loadDevices (http://127.0.0.1:8787/:375:36)
