@@ -130,6 +130,33 @@ tapoctl --timeout-seconds 5 status desk
 - Tapo is still an unofficial API, so firmware updates can break this.
 - On Linux this build uses the `keyring` crate's `linux-native` backend. If that backend is not available in the current session, `login` will fail rather than writing the password to disk.
 
+## Library usage
+
+`tapoctl` can also be used as a Rust library by other local services. The reusable API is centred on `TapoController`, which takes explicit credentials and exposes discovery, state reads, power control, toggling, and energy snapshots for supported energy-monitoring plugs.
+
+```rust,no_run
+use tapoctl::{DeviceConfig, DeviceModel, TapoController, TapoCredentials};
+
+# #[tokio::main]
+# async fn main() -> anyhow::Result<()> {
+let controller = TapoController::new(TapoCredentials {
+    username: "you@example.com".to_string(),
+    password: "tapo-password".to_string(),
+});
+
+let device = DeviceConfig {
+    ip: "192.168.1.50".parse()?,
+    model: DeviceModel::P110,
+};
+
+let snapshot = controller.read_device(&device).await?;
+controller.set_power(&device, !snapshot.device_on).await?;
+# Ok(())
+# }
+```
+
+Energy data comes from the `tapo` crate's local energy-monitoring handler for P110/P110M/P115 devices. The library currently exposes current power, today's energy/runtime, and current-month energy/runtime where the device reports those values.
+
 ## Development
 
 ```bash

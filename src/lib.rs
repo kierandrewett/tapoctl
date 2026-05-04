@@ -2,9 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use if_addrs::{IfAddr, get_if_addrs};
 use serde::{Deserialize, Serialize};
+use tapo::{ApiClient, DiscoveryResult, StreamExt};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -49,6 +52,40 @@ pub struct DeviceConfig {
     pub model: DeviceModel,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TapoCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TapoController {
+    credentials: TapoCredentials,
+    timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceSnapshot {
+    pub ip: IpAddr,
+    pub model: DeviceModel,
+    pub device_model: String,
+    pub nickname: String,
+    pub device_type: String,
+    pub device_on: bool,
+    pub on_time_seconds: u64,
+    pub energy: Option<EnergySnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EnergySnapshot {
+    pub current_power_mw: Option<u64>,
+    pub current_power_w: Option<u64>,
+    pub today_energy_wh: u64,
+    pub month_energy_wh: u64,
+    pub today_runtime_minutes: u64,
+    pub month_runtime_minutes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeviceModel {
@@ -89,6 +126,237 @@ impl FromStr for DeviceModel {
 
 pub fn supported_device_model(model: &str) -> Option<DeviceModel> {
     DeviceModel::from_str(model).ok()
+}
+
+impl TapoController {
+    pub fn new(credentials: TapoCredentials) -> Self {
+        Self::with_timeout(credentials, 30)
+    }
+
+    pub fn with_timeout(credentials: TapoCredentials, timeout_seconds: u64) -> Self {
+        Self {
+            credentials,
+            timeout_seconds,
+        }
+    }
+
+    pub async fn discover(
+        &self,
+        positional_targets: &[String],
+        flag_targets: &[String],
+        discovery_timeout_seconds: u64,
+    ) -> Result<Vec<DiscoveredDevice>> {
+        let auto_targets = if positional_targets.is_empty() && flag_targets.is_empty() {
+            automatic_discovery_targets().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let targets =
+            discovery_scan_targets_with_auto(positional_targets, flag_targets, auto_targets)?;
+
+        self.discover_targets(&targets, discovery_timeout_seconds)
+            .await
+    }
+
+    pub async fn discover_targets(
+        &self,
+        targets: &[DiscoveryTarget],
+        discovery_timeout_seconds: u64,
+    ) -> Result<Vec<DiscoveredDevice>> {
+        if !(1..=60).contains(&discovery_timeout_seconds) {
+            return Err(anyhow!(
+                "discovery_timeout_seconds must be between 1 and 60"
+            ));
+        }
+
+        let client = self.client();
+        let mut devices = Vec::new();
+        let mut seen_ips = BTreeSet::new();
+
+        for target in targets {
+            let mut discovery = client
+                .clone()
+                .discover_devices(target.scan_address.clone(), discovery_timeout_seconds)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to start discovery for {} ({})",
+                        target.requested, target.scan_address
+                    )
+                })?;
+
+            while let Some(result) = discovery.next().await {
+                let result = result.with_context(|| {
+                    format!(
+                        "failed to read discovery response from {}",
+                        target.scan_address
+                    )
+                })?;
+                let device = discovered_device_from_result(&result)?;
+
+                if seen_ips.insert(device.ip) {
+                    devices.push(device);
+                }
+            }
+        }
+
+        Ok(devices)
+    }
+
+    pub async fn read_device(&self, device: &DeviceConfig) -> Result<DeviceSnapshot> {
+        match device.model {
+            DeviceModel::P100 => {
+                let info = self
+                    .client()
+                    .p100(device.ip.to_string())
+                    .await?
+                    .get_device_info()
+                    .await?;
+
+                Ok(DeviceSnapshot {
+                    ip: device.ip,
+                    model: device.model,
+                    device_model: info.model,
+                    nickname: info.nickname,
+                    device_type: info.r#type,
+                    device_on: info.device_on,
+                    on_time_seconds: info.on_time,
+                    energy: None,
+                })
+            }
+            DeviceModel::P105 => {
+                let info = self
+                    .client()
+                    .p105(device.ip.to_string())
+                    .await?
+                    .get_device_info()
+                    .await?;
+
+                Ok(DeviceSnapshot {
+                    ip: device.ip,
+                    model: device.model,
+                    device_model: info.model,
+                    nickname: info.nickname,
+                    device_type: info.r#type,
+                    device_on: info.device_on,
+                    on_time_seconds: info.on_time,
+                    energy: None,
+                })
+            }
+            DeviceModel::P110 => {
+                let handler = self.client().p110(device.ip.to_string()).await?;
+                let info = handler.get_device_info().await?;
+                let current_power = handler.get_current_power().await?;
+                let energy_usage = handler.get_energy_usage().await?;
+
+                Ok(DeviceSnapshot {
+                    ip: device.ip,
+                    model: device.model,
+                    device_model: info.model,
+                    nickname: info.nickname,
+                    device_type: info.r#type,
+                    device_on: info.device_on,
+                    on_time_seconds: info.on_time,
+                    energy: Some(EnergySnapshot {
+                        current_power_mw: energy_usage.current_power,
+                        current_power_w: Some(current_power.current_power),
+                        today_energy_wh: energy_usage.today_energy,
+                        month_energy_wh: energy_usage.month_energy,
+                        today_runtime_minutes: energy_usage.today_runtime,
+                        month_runtime_minutes: energy_usage.month_runtime,
+                    }),
+                })
+            }
+            DeviceModel::P115 => {
+                let handler = self.client().p115(device.ip.to_string()).await?;
+                let info = handler.get_device_info().await?;
+                let current_power = handler.get_current_power().await?;
+                let energy_usage = handler.get_energy_usage().await?;
+
+                Ok(DeviceSnapshot {
+                    ip: device.ip,
+                    model: device.model,
+                    device_model: info.model,
+                    nickname: info.nickname,
+                    device_type: info.r#type,
+                    device_on: info.device_on,
+                    on_time_seconds: info.on_time,
+                    energy: Some(EnergySnapshot {
+                        current_power_mw: energy_usage.current_power,
+                        current_power_w: Some(current_power.current_power),
+                        today_energy_wh: energy_usage.today_energy,
+                        month_energy_wh: energy_usage.month_energy,
+                        today_runtime_minutes: energy_usage.today_runtime,
+                        month_runtime_minutes: energy_usage.month_runtime,
+                    }),
+                })
+            }
+        }
+    }
+
+    pub async fn set_power(&self, device: &DeviceConfig, on: bool) -> Result<()> {
+        match device.model {
+            DeviceModel::P100 => {
+                set_plug_power(self.client().p100(device.ip.to_string()).await?, on).await
+            }
+            DeviceModel::P105 => {
+                set_plug_power(self.client().p105(device.ip.to_string()).await?, on).await
+            }
+            DeviceModel::P110 => {
+                set_plug_power(self.client().p110(device.ip.to_string()).await?, on).await
+            }
+            DeviceModel::P115 => {
+                set_plug_power(self.client().p115(device.ip.to_string()).await?, on).await
+            }
+        }
+    }
+
+    pub async fn toggle_power(&self, device: &DeviceConfig) -> Result<DeviceSnapshot> {
+        let snapshot = self.read_device(device).await?;
+        self.set_power(device, !snapshot.device_on).await?;
+        self.read_device(device).await
+    }
+
+    fn client(&self) -> ApiClient {
+        ApiClient::new(&self.credentials.username, &self.credentials.password)
+            .with_timeout(Duration::from_secs(self.timeout_seconds))
+    }
+}
+
+async fn set_plug_power<H>(handler: H, on: bool) -> Result<()>
+where
+    H: PlugPowerControl,
+{
+    if on {
+        handler.turn_on().await
+    } else {
+        handler.turn_off().await
+    }
+}
+
+trait PlugPowerControl {
+    async fn turn_on(&self) -> Result<()>;
+    async fn turn_off(&self) -> Result<()>;
+}
+
+impl PlugPowerControl for tapo::PlugHandler {
+    async fn turn_on(&self) -> Result<()> {
+        Ok(self.on().await?)
+    }
+
+    async fn turn_off(&self) -> Result<()> {
+        Ok(self.off().await?)
+    }
+}
+
+impl PlugPowerControl for tapo::PlugEnergyMonitoringHandler {
+    async fn turn_on(&self) -> Result<()> {
+        Ok(self.on().await?)
+    }
+
+    async fn turn_off(&self) -> Result<()> {
+        Ok(self.off().await?)
+    }
 }
 
 pub fn discovery_scan_targets(
@@ -157,6 +425,37 @@ pub fn discovery_targets_from_local_ipv4_networks(
     }
 
     targets
+}
+
+pub fn automatic_discovery_targets() -> Result<Vec<DiscoveryTarget>> {
+    let networks = get_if_addrs()
+        .context("failed to read local network interfaces")?
+        .into_iter()
+        .filter_map(|interface| match interface.addr {
+            IfAddr::V4(address) => Some(LocalIpv4Network {
+                name: interface.name,
+                ip: address.ip,
+                netmask: address.netmask,
+            }),
+            IfAddr::V6(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(discovery_targets_from_local_ipv4_networks(&networks))
+}
+
+pub fn discovered_device_from_result(result: &DiscoveryResult) -> Result<DiscoveredDevice> {
+    let ip = result.ip();
+
+    Ok(DiscoveredDevice {
+        ip: ip
+            .parse::<IpAddr>()
+            .with_context(|| format!("discovered device returned an invalid IP address: {ip}"))?,
+        model: result.model().to_string(),
+        nickname: result.nickname().to_string(),
+        device_type: result.device_type().to_string(),
+        supported_model: supported_device_model(result.model()),
+    })
 }
 
 pub fn discovery_add_candidates(

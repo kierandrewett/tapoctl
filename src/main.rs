@@ -8,15 +8,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{MultiSelect, theme::ColorfulTheme};
-use if_addrs::{IfAddr, get_if_addrs};
 use keyring::{Entry, Error as KeyringError};
 use rpassword::prompt_password;
-use tapo::{ApiClient, DiscoveryResult, StreamExt};
+use tapo::{ApiClient, StreamExt};
 use tapoctl::{
-    Config, DeviceConfig, DeviceModel, DiscoveredDevice, DiscoveryAddCandidate, DiscoveryTarget,
-    LocalIpv4Network, add_device, add_discovery_candidates, discovery_add_candidates,
-    discovery_scan_targets_with_auto, discovery_targets_from_local_ipv4_networks, get_device,
-    remove_device, supported_device_model,
+    Config, DeviceConfig, DeviceModel, DiscoveredDevice, DiscoveryAddCandidate, add_device,
+    add_discovery_candidates, automatic_discovery_targets, discovered_device_from_result,
+    discovery_add_candidates, discovery_scan_targets_with_auto, get_device, remove_device,
 };
 
 const KEYRING_SERVICE: &str = "dev.kieran.tapoctl";
@@ -341,37 +339,6 @@ async fn discover(args: DiscoverArgs, timeout_seconds: u64) -> Result<()> {
 
 fn should_prompt_for_discovery_adds(args: &DiscoverArgs) -> bool {
     !args.no_interactive && io::stdin().is_terminal() && io::stdout().is_terminal()
-}
-
-fn automatic_discovery_targets() -> Result<Vec<DiscoveryTarget>> {
-    let networks = get_if_addrs()
-        .context("failed to read local network interfaces")?
-        .into_iter()
-        .filter_map(|interface| match interface.addr {
-            IfAddr::V4(address) => Some(LocalIpv4Network {
-                name: interface.name,
-                ip: address.ip,
-                netmask: address.netmask,
-            }),
-            IfAddr::V6(_) => None,
-        })
-        .collect::<Vec<_>>();
-
-    Ok(discovery_targets_from_local_ipv4_networks(&networks))
-}
-
-fn discovered_device_from_result(result: &DiscoveryResult) -> Result<DiscoveredDevice> {
-    let ip = result.ip();
-
-    Ok(DiscoveredDevice {
-        ip: ip
-            .parse::<IpAddr>()
-            .with_context(|| format!("discovered device returned an invalid IP address: {ip}"))?,
-        model: result.model().to_string(),
-        nickname: result.nickname().to_string(),
-        device_type: result.device_type().to_string(),
-        supported_model: supported_device_model(result.model()),
-    })
 }
 
 fn print_discovered_device(device: &DiscoveredDevice) {
